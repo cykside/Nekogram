@@ -7,6 +7,10 @@ on:
         description: "Gradle task (cek varian di TMessagesProj_App/build.gradle)"
         default: "assembleAfatRelease"
         required: true
+      mono:
+        description: "Terapkan tema hitam-putih (Mono)"
+        type: boolean
+        default: true
   push:
     tags: [ "v*" ]
 
@@ -24,6 +28,33 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 1
+
+      - name: Terapkan tema Mono
+        if: ${{ github.event.inputs.mono != 'false' }}
+        run: |
+          set -e
+          ACTIONBAR=TMessagesProj/src/main/java/org/telegram/ui/ActionBar
+          LAUNCH=TMessagesProj/src/main/java/org/telegram/ui/LaunchActivity.java
+
+          cp mono/MonoTheme.java "$ACTIONBAR/MonoTheme.java"
+
+          if git apply --check mono/Theme.java.patch 2>/dev/null; then
+            git apply mono/Theme.java.patch
+            echo "Theme.java.patch diterapkan"
+          elif git apply -R --check mono/Theme.java.patch 2>/dev/null; then
+            echo "Theme.java.patch sudah terpasang di repo, dilewati"
+          else
+            echo "::error::mono/Theme.java.patch tidak cocok dengan Theme.java saat ini (upstream berubah?). Buat ulang patch."
+            exit 1
+          fi
+
+          python3 mono/inject_system_bars.py "$LAUNCH"
+
+          # verifikasi
+          test -f "$ACTIONBAR/MonoTheme.java"
+          n=$(grep -c "MonoTheme.apply" "$ACTIONBAR/Theme.java")
+          echo "MonoTheme.apply muncul $n kali di Theme.java"
+          [ "$n" -ge 3 ]
 
       - name: Free disk space
         run: |
