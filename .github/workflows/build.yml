@@ -1,131 +1,100 @@
-name: Build
+name: Build Nekogram Mono
 
 on:
-  push:
-    branches: [ "dev", "ci" ]
-    paths-ignore:
-      - '**.md'
-      - '.github/**'
-      - '!.github/workflows/build.yml'
-  workflow_call:
   workflow_dispatch:
+    inputs:
+      gradle_task:
+        description: "Gradle task (cek varian di TMessagesProj_App/build.gradle)"
+        default: "assembleAfatRelease"
+        required: true
+  push:
+    tags: [ "v*" ]
+
+env:
+  MAIN_MODULE: TMessagesProj_App
 
 jobs:
   build:
-    runs-on: blacksmith-32vcpu-ubuntu-2404
-    permissions:
-      id-token: write
-      attestations: write
-      artifact-metadata: write
-    env:
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-      CCACHE_HARDLINK: "true"
-      CCACHE_NOHASHDIR: "true"
-      CCACHE_MAXSIZE: "10G"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout (dengan submodule)
+        uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: recursive
+          fetch-depth: 1
 
-      - name: Set up JDK 25
-        uses: actions/setup-java@v6
-        with:
-          java-version: '25'
-          distribution: 'temurin'
-
-      - name: Set up ccache
-        uses: Chocobo1/setup-ccache-action@v1
-        with:
-          remove_stale_cache: false
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          cache-read-only: false
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: "build-tools;37.0.0 ndk;27.3.13750724 platforms;android-37.0 cmake;3.22.1"
-
-      - name: Configure Gradle
+      - name: Free disk space
         run: |
-          mkdir -p ~/.gradle
-          echo 'org.gradle.caching=true' >> ~/.gradle/gradle.properties
-          echo 'org.gradle.parallel=true' >> ~/.gradle/gradle.properties
-          echo 'org.gradle.jvmargs=-Xmx56g -Dfile.encoding=UTF-8 -XX:+UseParallelGC' >> ~/.gradle/gradle.properties
-          echo 'android.native.buildOutput=verbose' >> ~/.gradle/gradle.properties
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
 
-      - name: Configure Signing
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Baca versi NDK & build-tools dari proyek
         run: |
-          echo "storeFile=${{ github.workspace }}/keystore.jks" >> local.properties
-          echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}" >> local.properties
-          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> local.properties
-          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> local.properties
-          
-          echo "${{ secrets.KEYSTORE_JKS }}" | base64 --decode > keystore.jks
+          ndk=$(sed -n 's:^\s*ndkVersion "\([^"]*\)"\s*$:\1:p' TMessagesProj/build.gradle | head -n1)
+          bt=$(sed -n "s:^\s*buildToolsVersion '\([^']*\)'\s*$:\1:p" ${MAIN_MODULE}/build.gradle | head -n1)
+          echo "NDK_VERSION=$ndk" >> $GITHUB_ENV
+          echo "BUILD_TOOLS=$bt" >> $GITHUB_ENV
+          echo "NDK=$ndk  build-tools=$bt"
 
-      - name: Configure Secrets
+      - name: Install NDK, CMake, build-tools
         run: |
-          echo "apiId=${{ secrets.API_ID }}" >> local.properties
-          echo "apiHash=${{ secrets.API_HASH }}" >> local.properties
-          echo "helperBotId=${{ secrets.HELPER_BOT_ID }}" >> local.properties
-          echo "helperBotUsername=${{ secrets.HELPER_BOT_USERNAME }}" >> local.properties
-          echo "sentryDsn=${{ secrets.SENTRY_DSN }}" >> local.properties
-          echo "mapsApiKey=${{ secrets.MAPS_API_KEY }}" >> local.properties
+          yes | sdkmanager --licenses >/dev/null || true
+          pkgs=("cmake;3.22.1")
+          [ -n "$NDK_VERSION" ] && pkgs+=("ndk;$NDK_VERSION")
+          [ -n "$BUILD_TOOLS" ] && pkgs+=("build-tools;$BUILD_TOOLS")
+          sdkmanager "${pkgs[@]}"
 
-          echo "${{ secrets.GOOGLE_SERVICES_JSON }}" | base64 --decode > TMessagesProj_App/google-services.json
-          echo "${{ secrets.SENTRY_PROPERTIES }}" | base64 --decode > sentry.properties
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build yasm
 
-      - name: Build with Gradle
+      - name: Inject secrets
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          EXTRA_JAVA_B64: ${{ secrets.EXTRA_JAVA_B64 }}
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          ./gradlew assembleRelease
-          ./gradlew bundlePlay
-          ./gradlew sentryUploadSourceBundlePlay
+          echo "$GOOGLE_SERVICES_JSON" > TMessagesProj/google-services.json
 
-      - name: Attest
-        uses: actions/attest@v4
-        with:
-          subject-path: '${{ github.workspace }}/TMessagesProj_App/build/outputs'
+          # Extra.java opsional: kalau secret kosong, pakai file bawaan repo
+          if [ -n "$EXTRA_JAVA_B64" ]; then
+            echo "$EXTRA_JAVA_B64" | base64 -d > TMessagesProj/src/main/java/tw/nekomimi/nekogram/Extra.java
+          fi
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: outputs
-          path: TMessagesProj_App/build/outputs
+          echo "$KEYSTORE_B64" | base64 -d > "$GITHUB_WORKSPACE/release.keystore"
+          {
+            echo "storeFile=$GITHUB_WORKSPACE/release.keystore"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } >> local.properties
 
-      - name: Upload arm64-v8a build apk
-        uses: actions/upload-artifact@v7
-        with:
-          path: TMessagesProj_App/build/outputs/apk/release/*-arm64-v8a.apk
-          archive: false
+          echo "org.gradle.jvmargs=-Xmx4g -XX:+UseParallelGC -Dfile.encoding=UTF-8" >> gradle.properties
+          echo "org.gradle.daemon=false" >> gradle.properties
 
-      - name: Upload armeabi-v7a build apk
-        uses: actions/upload-artifact@v7
-        with:
-          path: TMessagesProj_App/build/outputs/apk/release/*-armeabi-v7a.apk
-          archive: false
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :${MAIN_MODULE}:${{ github.event.inputs.gradle_task || 'assembleAfatRelease' }} --stacktrace
 
-      - name: Upload universal build apk
-        uses: actions/upload-artifact@v7
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          path: TMessagesProj_App/build/outputs/apk/release/*-universal.apk
-          archive: false
+          name: nekogram-mono-${{ github.sha }}
+          path: ${{ env.MAIN_MODULE }}/build/outputs/apk/**/*.apk
+          if-no-files-found: error
 
-      - name: Upload x86 build apk
-        uses: actions/upload-artifact@v7
-        with:
-          path: TMessagesProj_App/build/outputs/apk/release/*-x86.apk
-          archive: false
-
-      - name: Upload x86_64 build apk
-        uses: actions/upload-artifact@v7
-        with:
-          path: TMessagesProj_App/build/outputs/apk/release/*-x86_64.apk
-          archive: false
-
-      - name: Upload build bundle
-        uses: actions/upload-artifact@v7
-        with:
-          path: TMessagesProj_App/build/outputs/bundle/play/*-play.aab
-          archive: false
+      - name: Hapus rahasia dari runner
+        if: always()
+        run: rm -f release.keystore TMessagesProj/google-services.json
